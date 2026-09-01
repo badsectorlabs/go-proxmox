@@ -2,14 +2,20 @@ package proxmox
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/luthermonson/go-proxmox/tests/mocks"
 	"github.com/luthermonson/go-proxmox/tests/mocks/config"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -130,6 +136,50 @@ func TestClient_VNCWebSocket_APITokenUnsupported(t *testing.T) {
 	assert.Nil(t, errs)
 	assert.Nil(t, closer)
 	assert.ErrorIs(t, err, ErrAPITokenWebSocketUnsupported)
+}
+
+func TestClient_VNCWebSocket_CloseAfterPeerDisconnect(t *testing.T) {
+	serverResult := make(chan error, 1)
+	upgrader := websocket.Upgrader{Subprotocols: []string{"binary"}}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverResult <- err
+			return
+		}
+
+		tcpConn, ok := conn.UnderlyingConn().(*net.TCPConn)
+		if !ok {
+			serverResult <- fmt.Errorf("unexpected connection type %T", conn.UnderlyingConn())
+			return
+		}
+		if err := tcpConn.SetLinger(0); err != nil {
+			serverResult <- err
+			return
+		}
+		serverResult <- tcpConn.Close()
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, WithHTTPClient(server.Client()))
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	_, recv, errs, closeVNC, err := client.VNCWebSocket(wsURL, &VNC{})
+	require.NoError(t, err)
+
+	select {
+	case err := <-serverResult:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for peer disconnect")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	require.NoError(t, closeVNC())
+
+	_, recvOpen := <-recv
+	assert.False(t, recvOpen)
+	_, errsOpen := <-errs
+	assert.False(t, errsOpen)
 }
 
 func TestClient_Version7(t *testing.T) {
