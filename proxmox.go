@@ -518,17 +518,34 @@ func (c *Client) VNCWebSocket(path string, vnc *VNC) (chan []byte, chan []byte, 
 	errs := make(chan error)
 	done := make(chan struct{})
 
-	closer := func() error {
-		close(done)
-		time.Sleep(1 * time.Second)
-		close(send)
-		close(recv)
-		close(errs)
+	var (
+		closeOnce sync.Once
+		closeErr  error
+		workers   sync.WaitGroup
+	)
 
-		return conn.Close()
+	sendError := func(err error) {
+		select {
+		case errs <- err:
+		case <-done:
+		}
 	}
 
+	closer := func() error {
+		closeOnce.Do(func() {
+			close(done)
+			closeErr = conn.Close()
+			workers.Wait()
+			close(recv)
+			close(errs)
+		})
+		return closeErr
+	}
+
+	workers.Add(2)
+
 	go func() {
+		defer workers.Done()
 		for {
 			select {
 			case <-done:
@@ -539,28 +556,34 @@ func (c *Client) VNCWebSocket(path string, vnc *VNC) (chan []byte, chan []byte, 
 					if strings.Contains(err.Error(), "use of closed network connection") {
 						return
 					}
-					if !websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-						return
+					if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+						sendError(err)
 					}
-					errs <- err
+					return
 				}
-				recv <- msg
+				select {
+				case recv <- msg:
+				case <-done:
+					return
+				}
 			}
 		}
 	}()
 
 	go func() {
+		defer workers.Done()
 		for {
 			select {
 			case <-done:
-				if err := conn.WriteMessage(websocket.CloseMessage, []byte{}); err != nil {
-					errs <- err
-				}
 				return
-			case msg := <-send:
+			case msg, ok := <-send:
+				if !ok {
+					return
+				}
 				c.log.Debugf("sending: %s", msg)
 				if err := conn.WriteMessage(websocket.BinaryMessage, msg); err != nil {
-					errs <- err
+					sendError(err)
+					return
 				}
 			}
 		}
