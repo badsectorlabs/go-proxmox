@@ -56,13 +56,12 @@ func IsErrNoop(err error) bool {
 	return errors.Is(err, ErrNoop)
 }
 
-// ErrAPITokenWebSocketUnsupported is returned by TermWebSocket and VNCWebSocket
-// when the client is authenticated with an API token. Proxmox's vncwebsocket
-// endpoint rejects the token-suffixed user (e.g. "root@pam!tokenname") during
-// the post-upgrade auth handshake, which surfaces here as "unexpected EOF" and
-// on the server as `failed waiting for client: timed out`. Use WithCredentials
-// or WithSession for terminal/VNC access.
-var ErrAPITokenWebSocketUnsupported = errors.New("proxmox does not accept API tokens for vncwebsocket; use WithCredentials or WithSession")
+// ErrAPITokenWebSocketUnsupported is returned by TermWebSocket when the client
+// is authenticated with an API token. Proxmox's termproxy rejects token-suffixed
+// users (e.g. "root@pam!tokenname") during its post-upgrade auth handshake.
+// Use WithCredentials or WithSession for terminal access. QEMU VNC connections
+// use a different authentication flow and support API tokens.
+var ErrAPITokenWebSocketUnsupported = errors.New("proxmox does not accept API tokens for termproxy; use WithCredentials or WithSession")
 
 func IsAPITokenWebSocketUnsupported(err error) bool {
 	return errors.Is(err, ErrAPITokenWebSocketUnsupported)
@@ -78,7 +77,7 @@ func MakeTag(v string) string {
 //
 // PVE applies its own urlencoded-string validator that rejects '+' as a space
 // encoding and requires every reserved character to be percent-encoded — the
-// Python urllib.parse.quote(s, safe='') style. Go's net/url.QueryEscape emits
+// Python urllib.parse.quote(s, safe=”) style. Go's net/url.QueryEscape emits
 // '+' for spaces (HTML form encoding), so its output alone fails validation
 // with "invalid format - invalid urlencoded string". See issue #144.
 //
@@ -397,8 +396,7 @@ func (c *Client) handleResponse(res *http.Response, v interface{}) error {
 // and Container.TermWebSocket.
 //
 // Returns ErrAPITokenWebSocketUnsupported if the client is authenticated with
-// an API token; Proxmox does not accept tokens for /vncwebsocket — see issue
-// luthermonson/go-proxmox#221 and the linked Proxmox forum threads.
+// an API token; Proxmox's termproxy authentication rejects token-suffixed users.
 func (c *Client) TermWebSocket(path string, term *Term) (chan []byte, chan []byte, chan error, func() error, error) {
 	if c.token != "" {
 		return nil, nil, nil, nil, ErrAPITokenWebSocketUnsupported
@@ -559,12 +557,9 @@ func (c *Client) TermWebSocket(path string, term *Term) (chan []byte, chan []byt
 // session. It is invoked by Node.VNCWebSocket, VirtualMachine.VNCWebSocket,
 // and Container.VNCWebSocket.
 //
-// Returns ErrAPITokenWebSocketUnsupported if the client is authenticated with
-// an API token; see TermWebSocket for the underlying Proxmox limitation.
+// API tokens are supported for QEMU VNC connections. Unlike TermWebSocket,
+// VNCWebSocket does not perform a termproxy authentication handshake.
 func (c *Client) VNCWebSocket(path string, vnc *VNC) (chan []byte, chan []byte, chan error, func() error, error) {
-	if c.token != "" {
-		return nil, nil, nil, nil, ErrAPITokenWebSocketUnsupported
-	}
 	if strings.HasPrefix(path, "/") {
 		path = strings.Replace(c.baseURL, "https://", "wss://", 1) + path
 	}
