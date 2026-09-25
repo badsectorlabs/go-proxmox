@@ -128,14 +128,60 @@ func TestClient_TermWebSocket_APITokenUnsupported(t *testing.T) {
 	assert.True(t, IsAPITokenWebSocketUnsupported(err))
 }
 
-func TestClient_VNCWebSocket_APITokenUnsupported(t *testing.T) {
-	c := NewClient(TestURI, WithAPIToken("root@pam!test", "secret"))
-	send, recv, errs, closer, err := c.VNCWebSocket("/nodes/n/qemu/100/vncwebsocket?port=1&vncticket=t", &VNC{})
-	assert.Nil(t, send)
-	assert.Nil(t, recv)
-	assert.Nil(t, errs)
-	assert.Nil(t, closer)
-	assert.ErrorIs(t, err, ErrAPITokenWebSocketUnsupported)
+func TestClient_VNCWebSocket_APIToken(t *testing.T) {
+	upgrader := websocket.Upgrader{Subprotocols: []string{"binary"}}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "PVEAPIToken=root@pam!test=secret" {
+			http.Error(w, "invalid token", http.StatusUnauthorized)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		if err := conn.WriteMessage(websocket.BinaryMessage, []byte("RFB 003.008\n")); err != nil {
+			return
+		}
+		// Keep the VNC stream open until the client closes it.
+		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			return
+		}
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+
+	for _, tc := range []struct {
+		name   string
+		secret string
+	}{
+		{name: "authorized", secret: "secret"},
+		{name: "unauthorized", secret: "wrong-secret"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := NewClient(server.URL,
+				WithHTTPClient(server.Client()),
+				WithAPIToken("root@pam!test", tc.secret),
+			)
+			_, recv, errs, closeVNC, err := client.VNCWebSocket("/nodes/n/qemu/100/vncwebsocket?port=5900&vncticket=t", &VNC{})
+			if tc.name == "unauthorized" {
+				require.ErrorIs(t, err, websocket.ErrBadHandshake)
+				return
+			}
+			require.NoError(t, err)
+			defer func() { assert.NoError(t, closeVNC()) }()
+
+			select {
+			case msg := <-recv:
+				assert.Equal(t, "RFB 003.008\n", string(msg))
+			case err := <-errs:
+				t.Fatalf("VNC stream failed: %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for VNC protocol version")
+			}
+		})
+	}
 }
 
 func TestClient_VNCWebSocket_CloseAfterPeerDisconnect(t *testing.T) {
